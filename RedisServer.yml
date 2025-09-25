@@ -1,0 +1,229 @@
+---
+# Author: jashi111
+# Description: Playbook to install Redis-Server and configure a 3-node Sentinel cluster with HA
+
+- name: Install and Configure Redis Cluster
+  hosts: redis
+  become: true
+  gather_facts: true
+  vars_files:
+    - vars.yml
+
+  vars_prompt:
+    - name: confirm_pre_tasks
+      prompt: "Do you want to execute the pre-tasks (stop and purge existing Redis setup)? (yes/no)"
+      private: no
+
+  pre_tasks:
+    - name: Stop Redis server and sentinel services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - redis-server
+        - redis-sentinel
+      ignore_errors: yes
+      when: confirm_pre_tasks == 'yes'
+
+    - name: Kill any remaining Redis processes
+      ansible.builtin.shell: |
+        pkill -f redis-server || true
+        pkill -f redis-sentinel || true
+      ignore_errors: yes
+      when: confirm_pre_tasks == 'yes'
+
+    - name: Purge Redis packages
+      ansible.builtin.apt:
+        name:
+          - redis
+          - redis-server
+          - redis-tools
+        state: absent
+        purge: yes
+        autoremove: yes
+        update_cache: yes
+      when: confirm_pre_tasks == 'yes'
+
+    - name: Remove Redis configuration, data, and log directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/redis
+        - /var/lib/redis
+        - /var/log/redis
+        - /etc/systemd/system/redis-sentinel.service
+      when: confirm_pre_tasks == 'yes'
+
+    - name: Remove Redis Sentinel config file if exists
+      ansible.builtin.file:
+        path: /etc/redis/sentinel.conf
+        state: absent
+      when: confirm_pre_tasks == 'yes'
+
+    - name: Remove Redis APT repository and GPG key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/redis.list
+        - /usr/share/keyrings/redis-archive-keyring.gpg
+      when: confirm_pre_tasks == 'yes'
+
+    - name: Reload systemd daemon after removing unit files
+      ansible.builtin.systemd:
+        daemon_reload: yes
+      when: confirm_pre_tasks == 'yes'
+
+  tasks:
+    - name: Ensure required packages are installed
+      ansible.builtin.apt:
+        name:
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Redis GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/redis-archive-keyring.gpg
+
+    - name: Set correct permissions on Redis GPG key
+      ansible.builtin.file:
+        path: /usr/share/keyrings/redis-archive-keyring.gpg
+        mode: '0644'
+
+    - name: Add Redis APT repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/redis.list
+        content: |
+          deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb {{ ansible_lsb.codename }} main
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install Redis
+      ansible.builtin.apt:
+        name: redis
+        state: present
+
+    - name: Enable Redis service
+      ansible.builtin.systemd:
+        name: redis-server
+        enabled: yes
+        state: started
+
+    # ----------------- Redis config edits -----------------
+    - name: Ensure Redis logfile path
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^logfile '
+        line: 'logfile "/var/log/redis/redis.log"'
+
+    - name: Ensure Redis binds to all interfaces
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^bind '
+        line: 'bind 0.0.0.0'
+
+    - name: Set Redis password
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^#? requirepass '
+        line: 'requirepass "{{ REDIS_PASS }}"'
+
+    - name: Set Redis Master password
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^#? masterauth '
+        line: 'masterauth "{{ REDIS_PASS }}"'
+
+    - name: Disable protected mode
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^protected-mode '
+        line: 'protected-mode no'
+
+    - name: Ensure correct Redis data directory
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^dir '
+        line: 'dir /var/lib/redis'
+
+    # ----------------- Slave configuration -----------------
+    - name: Configure Redis slave nodes
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^# masterauth '
+        line: 'masterauth "{{ REDIS_PASS }}"'
+      when: hostvars[inventory_hostname].role == "slave"
+
+    - name: Configure replicaof on slave
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^# replicaof '
+        line: "replicaof {{ groups['redis'][0] }} 6379"
+      when: hostvars[inventory_hostname].role == "slave"
+
+    # ----------------- **NEW CHANGE** -----------------
+    # Remove replicaof or hardcoded master on master nodes
+    - name: Ensure master nodes have no replicaof
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^replicaof '
+        line: ''
+      when: hostvars[inventory_hostname].role == "master"
+    # -----------------------------------------------------
+
+    - name: Restart Redis after config changes
+      ansible.builtin.systemd:
+        name: redis-server
+        state: restarted
+
+    # ----------------- Sentinel Setup -----------------
+    - name: Create redis-sentinel systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/redis-sentinel.service
+        content: |
+          [Unit]
+          Description=Redis Sentinel
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/redis-server /etc/redis/sentinel.conf --sentinel
+          User=redis
+          Group=redis
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd after creating sentinel service
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Add Redis Sentinel configuration
+      ansible.builtin.blockinfile:
+        path: /etc/redis/sentinel.conf
+        create: yes
+        owner: redis
+        group: redis
+        mode: '0644'
+        block: |
+          port 26379
+          bind 0.0.0.0
+          sentinel monitor {{ MASTER_NAME }} {{ groups['redis'][0] }} 6379 2
+          sentinel down-after-milliseconds {{ MASTER_NAME }} 5000
+          sentinel failover-timeout {{ MASTER_NAME }} 10000
+          sentinel parallel-syncs {{ MASTER_NAME }} 1
+          sentinel auth-pass {{ MASTER_NAME }} {{ REDIS_PASS }}
+
+    - name: Enable and restart Redis Sentinel
+      ansible.builtin.systemd:
+        name: redis-sentinel
+        enabled: yes
+        state: restarted
