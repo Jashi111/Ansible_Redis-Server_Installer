@@ -1,4 +1,4 @@
-# 🐇 Redis Cluster Setup Using Ansible
+# 📦 Redis Cluster Setup Using Ansible
 
 This Ansible playbook automates the installation, configuration, and clustering of Redis on multiple nodes. Designed for scalable and production-ready deployments, it supports optional cleanup of existing Redis installations, and sets up a Redis Cluster with proper configuration and user privileges.
 
@@ -19,3 +19,4 @@ This Ansible playbook automates the installation, configuration, and clustering 
 - Cluster-aware configuration (e.g. cluster-enabled, cluster-config-file)
 - Optional custom user and authentication setup
 ---
+
